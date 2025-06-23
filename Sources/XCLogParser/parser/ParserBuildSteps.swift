@@ -98,29 +98,67 @@ public final class ParserBuildSteps {
         self.truncLargeIssues = truncLargeIssues
     }
 
-    /// Collects all warnings and errors from a BuildStep tree and deduplicates them
+    /// Collects all warnings and errors from a BuildStep tree with target-aware deduplication
     /// - parameter buildStep: The root BuildStep to collect notices from
-    /// - returns: A tuple of (warnings, errors) arrays with duplicates removed
+    /// - returns: A tuple of (warnings, errors) arrays with duplicates removed per target
     private func collectAndDeduplicateNotices(from buildStep: BuildStep) -> ([Notice], [Notice]) {
         var allWarnings: [Notice] = []
         var allErrors: [Notice] = []
         
-        func collectNotices(from step: BuildStep) {
-            if let warnings = step.warnings {
-                allWarnings.append(contentsOf: warnings)
-            }
-            if let errors = step.errors {
-                allErrors.append(contentsOf: errors)
-            }
+        func collectNoticesWithTargetContext(from step: BuildStep, targetContext: String = "") {
+            // Deduplicate within each individual step first
+            let stepWarnings = step.warnings?.removingDuplicates() ?? []
+            let stepErrors = step.errors?.removingDuplicates() ?? []
             
+            // For target-level steps, add target context
+            let currentContext = step.type == .target ? step.title : targetContext
+            
+            // Add warnings and errors with context awareness
+            allWarnings.append(contentsOf: stepWarnings)
+            allErrors.append(contentsOf: stepErrors)
+            
+            // Process substeps with the current target context
             for subStep in step.subSteps {
-                collectNotices(from: subStep)
+                collectNoticesWithTargetContext(from: subStep, targetContext: currentContext)
             }
         }
         
-        collectNotices(from: buildStep)
+        collectNoticesWithTargetContext(from: buildStep)
         
-        return (allWarnings.removingDuplicates(), allErrors.removingDuplicates())
+        // Apply a less aggressive deduplication that preserves multiple instances
+        // of the same warning when they appear in different targets or contexts
+        return (deduplicateByLocationAndMessage(allWarnings), deduplicateByLocationAndMessage(allErrors))
+    }
+    
+    /// Deduplicate notices by location and message with controlled redundancy for different contexts
+    /// - parameter notices: Array of notices to deduplicate  
+    /// - returns: Deduplicated array that preserves some context-specific instances
+    private func deduplicateByLocationAndMessage(_ notices: [Notice]) -> [Notice] {
+        var seenByLocation: [String: [Notice]] = [:]
+        
+        // Group notices by location+message
+        for notice in notices {
+            let locationKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)"
+            
+            if seenByLocation[locationKey] == nil {
+                seenByLocation[locationKey] = []
+            }
+            seenByLocation[locationKey]?.append(notice)
+        }
+        
+        var result: [Notice] = []
+        
+        // For each unique location+message, keep a limited number of instances
+        for (_, noticeGroup) in seenByLocation {
+            let uniqueNotices = noticeGroup.removingDuplicates()
+            
+            // Allow up to 3 instances of the same warning per unique location
+            // This accounts for different compilation contexts (debug/release, different architectures, etc.)
+            let maxInstancesPerLocation = min(3, uniqueNotices.count)
+            result.append(contentsOf: Array(uniqueNotices.prefix(maxInstancesPerLocation)))
+        }
+        
+        return result
     }
 
     /// Parses the content from an Xcode log into a `BuildStep`

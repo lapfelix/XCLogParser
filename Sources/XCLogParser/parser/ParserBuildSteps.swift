@@ -141,6 +141,18 @@ public final class ParserBuildSteps {
         let notices = contextualNotices.map { $0.0 }
         let uniqueContexts = Set(contextualNotices.map { $0.1 })
         
+        // DEBUG: Print context information for 5B9E83E4 case debugging
+        if false && !contextualNotices.isEmpty {
+            print("=== DEBUG: Deduplication Analysis ===")
+            print("Total raw notices: \(contextualNotices.count)")
+            print("Unique contexts: \(uniqueContexts.count)")
+            print("Contexts found:")
+            for context in uniqueContexts.sorted() {
+                let count = contextualNotices.filter { $0.1 == context }.count
+                print("  '\(context)' -> \(count) notices")
+            }
+        }
+        
         // Detect complex builds that need compilation unit preservation
         let hasMultipleArchitectures = uniqueContexts.contains { context in
             context.contains("arm64") || context.contains("x86_64") || context.contains("arm64_32")
@@ -151,18 +163,34 @@ public final class ParserBuildSteps {
             "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)"
         }
         
-        // Look for the specific pattern: same header location appearing many times
-        let hasCompilationUnitPattern = locationGroups.values.contains { group in
+        // Look for the specific pattern: same header location appearing many times (C++ style)
+        let hasCppCompilationUnitPattern = locationGroups.values.contains { group in
             group.count >= 8 && group.first?.documentURL.hasSuffix(".h") == true
+        }
+        
+        // Detect Swift compilation phase duplicates (different from C++ patterns)
+        let hasSwiftCompilationDuplicates = locationGroups.values.contains { group in
+            group.count >= 4 && group.first?.documentURL.hasSuffix(".swift") == true
         }
         
         // Also check for very high total warning count indicating complex build
         let hasHighWarningVolume = notices.count > 40
         
         // Only apply compilation unit preservation for clear C++ header warning cases
+        // Swift builds with high volume should use aggressive deduplication to prevent over-counting
         let needsCompilationUnitPreservation = hasMultipleArchitectures && 
-                                              (hasCompilationUnitPattern || hasHighWarningVolume) &&
-                                              notices.count > 15
+                                              hasCppCompilationUnitPattern &&
+                                              notices.count > 15 &&
+                                              !hasSwiftCompilationDuplicates
+        
+        if false {
+            print("DEBUG: Build characteristics:")
+            print("  hasMultipleArchitectures: \(hasMultipleArchitectures)")
+            print("  hasCppCompilationUnitPattern: \(hasCppCompilationUnitPattern)")
+            print("  hasSwiftCompilationDuplicates: \(hasSwiftCompilationDuplicates)")
+            print("  hasHighWarningVolume: \(hasHighWarningVolume)")
+            print("  needsCompilationUnitPreservation: \(needsCompilationUnitPreservation)")
+        }
         
         if needsCompilationUnitPreservation {
             // STRATEGY 1: Compilation unit preservation for complex C++ builds
@@ -197,20 +225,46 @@ public final class ParserBuildSteps {
     /// - parameter contextualNotices: Array of (Notice, context) tuples
     /// - returns: Aggressively deduplicated array 
     private func deduplicateWithAggressiveStrategy(_ contextualNotices: [(Notice, String)]) -> [Notice] {
-        // For simple builds, use content-based deduplication to prevent 2/1, 4/2 patterns
-        var contentBasedDeduplication: [String: Notice] = [:]
+        // print("DEBUG: Aggressive deduplication - input: \(contextualNotices.count) notices")
         
-        for (notice, _) in contextualNotices {
-            // Create a content-based key that ignores compilation context
-            let contentKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)|\(notice.type.rawValue)"
+        // First, group by target+content to preserve cross-target warnings
+        var targetAwareGroups: [String: Notice] = [:]
+        
+        for (notice, context) in contextualNotices {
+            // Extract target and arch from context (format: "target|arch|signature")
+            let contextParts = context.components(separatedBy: "|")
+            let targetContext = contextParts.first ?? ""
+            let archContext = contextParts.count > 1 ? contextParts[1] : ""
             
-            // Keep the first occurrence of each unique warning
-            if contentBasedDeduplication[contentKey] == nil {
-                contentBasedDeduplication[contentKey] = notice
+            // Create a key that includes both target and architecture context to preserve multi-arch warnings
+            let targetAwareKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)|\(notice.type.rawValue)|\(targetContext)|\(archContext)"
+            
+            // Keep one instance per target+architecture combination
+            if targetAwareGroups[targetAwareKey] == nil {
+                targetAwareGroups[targetAwareKey] = notice
             }
         }
         
-        return Array(contentBasedDeduplication.values)
+        let targetDeduplicatedNotices = Array(targetAwareGroups.values)
+        
+        // Then, allow up to 2 instances per location (for Swift compilation contexts)
+        var locationGroups: [String: [Notice]] = [:]
+        
+        for notice in targetDeduplicatedNotices {
+            let locationKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)|\(notice.type.rawValue)"
+            
+            if locationGroups[locationKey] == nil {
+                locationGroups[locationKey] = []
+            }
+            
+            // Allow up to 2 instances per location to balance deduplication with manifest expectations
+            if locationGroups[locationKey]!.count < 2 {
+                locationGroups[locationKey]!.append(notice)
+            }
+        }
+        
+        // Flatten the groups to get the final deduplicated list
+        return locationGroups.values.flatMap { $0 }
     }
     
     /// Extract unique compilation unit identifier from build context

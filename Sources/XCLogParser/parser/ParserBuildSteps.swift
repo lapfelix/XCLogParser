@@ -293,14 +293,9 @@ public final class ParserBuildSteps {
             locationGroups[locationKey]!.append(notice)
         }
         
-        // Check for Swift 6 concurrency warning patterns (typically need 4-6 instances)
-        let hasSwift6ConcurrencyWarnings = locationGroups.values.contains { group in
-            group.count >= 4 && (
-                group.first?.title.contains("@Sendable") == true ||
-                group.first?.title.contains("concurrency") == true ||
-                group.first?.title.contains("actor") == true ||
-                group.first?.title.contains("MainActor") == true
-            )
+        // Check for high-duplication patterns that need more instances (typically Swift/multi-context warnings)
+        let hasHighDuplicationWarnings = locationGroups.values.contains { group in
+            group.count >= 4
         }
         
         // Check for C++ header warnings that appear in many compilation units
@@ -314,8 +309,8 @@ public final class ParserBuildSteps {
         // Adaptive limit based on warning patterns
         if hasCppHeaderWarnings && hasHighWarningVolume {
             return 8  // C++ builds with many compilation units
-        } else if hasSwift6ConcurrencyWarnings {
-            return 6  // Swift 6 concurrency warnings across targets/architectures  
+        } else if hasHighDuplicationWarnings {
+            return 6  // High duplication warnings across targets/architectures  
         } else if hasCppHeaderWarnings {
             return 7  // C++ header warnings (less volume)
         } else if hasHighWarningVolume {
@@ -325,23 +320,14 @@ public final class ParserBuildSteps {
         }
     }
     
-    /// Detect if Swift compilation patterns require compilation step awareness
+    /// Detect if compilation patterns require compilation step awareness
     /// - parameter contextualNotices: Array of (Notice, context) tuples
-    /// - returns: true if Swift compilation awareness is needed
+    /// - returns: true if compilation awareness is needed
     private func detectSwiftCompilationPatterns(_ contextualNotices: [(Notice, String)]) -> Bool {
-        // Check for Swift concurrency warnings that appear in multiple compilation contexts
+        // Count occurrences per warning location to detect multi-context patterns
         var warningLocationCounts: [String: Int] = [:]
-        var hasSwiftConcurrencyWarnings = false
         
         for (notice, _) in contextualNotices {
-            // Check if this is a Swift concurrency-related warning
-            let title = notice.title.lowercased()
-            if title.contains("@sendable") || title.contains("concurrency") || 
-               title.contains("actor") || title.contains("mainactor") ||
-               title.contains("isolated") || title.contains("nonisolated") {
-                hasSwiftConcurrencyWarnings = true
-            }
-            
             // Count occurrences per warning location
             let locationKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)"
             warningLocationCounts[locationKey, default: 0] += 1
@@ -351,75 +337,79 @@ public final class ParserBuildSteps {
         let hasHighDuplicationRate = warningLocationCounts.values.contains { $0 >= 3 }
         let hasModerateDuplicationRate = warningLocationCounts.values.contains { $0 >= 2 }
         
-        // Enable compilation awareness for Swift concurrency OR high general duplication
-        return (hasSwiftConcurrencyWarnings && hasModerateDuplicationRate) || hasHighDuplicationRate
+        // Enable compilation awareness for moderate to high duplication patterns
+        return hasHighDuplicationRate || (hasModerateDuplicationRate && contextualNotices.count > 20)
     }
     
-    /// Extract a compilation-specific key from Swift compilation signature
+    /// Extract a compilation-specific key from compilation signature
     /// - parameter signature: The compilation signature string
     /// - returns: A compilation-specific identifier
     private func extractSwiftCompilationKey(from signature: String) -> String {
-        // For Swift compilation, we want to distinguish between different compilation phases
-        // but not be too granular to avoid over-counting
+        // For Swift compilation, distinguish between different compilation phases
+        // Use a hash-based approach to group similar compilation contexts
         
         if signature.contains("SwiftCompile") {
-            // Group Swift compilations by general phase rather than specific file
-            // This provides some differentiation while preventing excessive over-counting
-            if signature.contains("/Frameworks/") {
-                return "swift:framework"
-            } else if signature.contains("/Extensions/") {
-                return "swift:extension"  
-            } else if signature.contains("/Sources/") {
-                return "swift:main"
-            } else {
-                return "swift:other"
+            // Extract compilation phase indicators from path structure
+            let pathComponents = signature.components(separatedBy: "/")
+            
+            // Look for common project structure patterns
+            for component in pathComponents {
+                if component.lowercased().contains("framework") {
+                    return "swift:framework"
+                } else if component.lowercased().contains("extension") {
+                    return "swift:extension"
+                } else if component.lowercased().contains("test") {
+                    return "swift:test"
+                } else if component.lowercased().contains("source") {
+                    return "swift:main"
+                }
             }
+            
+            // Fallback to a general Swift compilation identifier
+            return "swift:general"
         }
         
-        // For other compilation types, use a generic identifier
-        if signature.contains("CompileC") {
-            return "c_compilation"
+        // For other compilation types, use generic identifiers
+        if signature.contains("CompileC") || signature.contains("Compile") {
+            return "compile_general"
         }
         
         return "other"
     }
     
-    /// Check if a warning is related to package resolution and should be excluded from build warnings
+    /// Check if a warning is related to package management and should be excluded from build warnings
     /// - parameter warning: The Notice to check
     /// - returns: true if the warning should be filtered out
     private func isPackageResolutionWarning(_ warning: Notice) -> Bool {
-        // Package resolution warnings typically have these characteristics:
-        // - Contains "package" or "Package" in title/description
-        // - Related to Swift Package Manager operations
-        // - Not related to actual compilation warnings
-        
         let title = warning.title.lowercased()
         let documentURL = warning.documentURL.lowercased()
         
-        // Check for empty documentURL which is common for package warnings
-        if documentURL.isEmpty && (title.contains("swiftpm") || title.contains("swift.swiftpm")) {
+        // Check for empty documentURL which is common for package management warnings
+        if documentURL.isEmpty && title.contains("swiftpm") {
             return true
         }
         
-        // Check for package-related keywords that indicate non-build warnings
-        let packageKeywords = [
-            "package resolution",
-            "swift package",
-            "package loading",
-            "package manager",
-            "dependency resolution",
+        // Check for package-related patterns that indicate non-build warnings
+        let packagePatterns = [
+            "package",
             "swiftpm",
-            "collections.json"  // Specific to the deprecation warning
+            "dependency",
+            "manifest",
+            "resolution"
         ]
         
-        for keyword in packageKeywords {
-            if title.contains(keyword) {
-                return true
-            }
+        // Count how many package-related terms appear in the title
+        let packageTermCount = packagePatterns.reduce(0) { count, pattern in
+            return count + (title.contains(pattern) ? 1 : 0)
+        }
+        
+        // If multiple package terms appear, likely a package management warning
+        if packageTermCount >= 2 {
+            return true
         }
         
         // Check for package-related file paths
-        if documentURL.contains("/packages/") || documentURL.contains("package.swift") {
+        if documentURL.contains("package") || documentURL.contains("manifest") {
             return true
         }
         

@@ -133,81 +133,115 @@ public final class ParserBuildSteps {
         return (deduplicateWithContext(contextualWarnings), deduplicateWithContext(contextualErrors))
     }
     
-    /// Enhanced deduplication that properly handles compilation context duplicates
+    /// Smart dual-strategy deduplication - preserves compilation units for complex builds, deduplicates simple builds  
     /// - parameter contextualNotices: Array of (Notice, context) tuples
-    /// - returns: Deduplicated array of notices with proper handling of compilation context duplicates
+    /// - returns: Optimally deduplicated array based on build characteristics
     private func deduplicateWithContext(_ contextualNotices: [(Notice, String)]) -> [Notice] {
-        // Extract notices and analyze build complexity
+        // Analyze build characteristics to determine deduplication strategy
         let notices = contextualNotices.map { $0.0 }
         let uniqueContexts = Set(contextualNotices.map { $0.1 })
         
-        // Detect multi-architecture builds by looking for architecture-specific contexts
+        // Detect complex builds that need compilation unit preservation
         let hasMultipleArchitectures = uniqueContexts.contains { context in
             context.contains("arm64") || context.contains("x86_64") || context.contains("arm64_32")
         } && uniqueContexts.count > 3
         
-        // Also detect complex builds that have high duplication ratios (like LiveShare, Transit projects)
-        let rawToDeduplicatedRatio = notices.count > 0 ? Double(notices.count) / Double(Set(notices.map { $0.title + "|" + $0.documentURL + "|\($0.startingLineNumber)" }).count) : 1.0
-        let isComplexBuild = hasMultipleArchitectures || (notices.count > 15 && rawToDeduplicatedRatio > 2.0)
-        
-        if isComplexBuild {
-            // For complex builds, use architecture-first deduplication to preserve multi-arch warnings
-            // Group by architecture context first, then deduplicate within each architecture
-            var architecturalGroups: [String: [(Notice, String)]] = [:]
-            
-            for (notice, context) in contextualNotices {
-                let architecture = extractArchitecture(from: context)
-                if architecturalGroups[architecture] == nil {
-                    architecturalGroups[architecture] = []
-                }
-                architecturalGroups[architecture]?.append((notice, context))
-            }
-            
-            var finalResult: [Notice] = []
-            var locationCounts: [String: Int] = [:]
-            
-            // Process each architecture group separately
-            for (architecture, noticesInArch) in architecturalGroups {
-                // Deduplicate within this architecture group
-                var seenInArch: Set<String> = []
-                
-                for (notice, _) in noticesInArch {
-                    let archSpecificKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)|\(notice.type.rawValue)|\(architecture)"
-                    
-                    if !seenInArch.contains(archSpecificKey) {
-                        seenInArch.insert(archSpecificKey)
-                        
-                        // Apply reasonable limits to prevent extreme over-counting
-                        let locationKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)"
-                        let currentCount = locationCounts[locationKey, default: 0]
-                        
-                        // Allow more instances for complex builds (up to 5 per location across all architectures)
-                        if currentCount < 5 {
-                            finalResult.append(notice)
-                            locationCounts[locationKey] = currentCount + 1
-                        }
-                    }
-                }
-            }
-            
-            return finalResult
-        } else {
-            // For simple builds, use aggressive content-based deduplication
-            // This fixes the 2/1, 4/2, 6/3 patterns where same warnings appear in multiple compilation steps
-            var contentBasedDeduplication: [String: Notice] = [:]
-            
-            for (notice, _) in contextualNotices {
-                // Create a content-based key that ignores compilation context
-                let contentKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)|\(notice.type.rawValue)"
-                
-                // Keep the first occurrence of each unique warning
-                if contentBasedDeduplication[contentKey] == nil {
-                    contentBasedDeduplication[contentKey] = notice
-                }
-            }
-            
-            return Array(contentBasedDeduplication.values)
+        // Detect true compilation unit patterns (like C++ header warnings)
+        let locationGroups = Dictionary(grouping: notices) { notice in
+            "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)"
         }
+        
+        // Look for the specific pattern: same header location appearing many times
+        let hasCompilationUnitPattern = locationGroups.values.contains { group in
+            group.count >= 8 && group.first?.documentURL.hasSuffix(".h") == true
+        }
+        
+        // Also check for very high total warning count indicating complex build
+        let hasHighWarningVolume = notices.count > 40
+        
+        // Only apply compilation unit preservation for clear C++ header warning cases
+        let needsCompilationUnitPreservation = hasMultipleArchitectures && 
+                                              (hasCompilationUnitPattern || hasHighWarningVolume) &&
+                                              notices.count > 15
+        
+        if needsCompilationUnitPreservation {
+            // STRATEGY 1: Compilation unit preservation for complex C++ builds
+            return deduplicateWithCompilationUnitPreservation(contextualNotices)
+        } else {
+            // STRATEGY 2: Aggressive deduplication for simple builds 
+            return deduplicateWithAggressiveStrategy(contextualNotices)
+        }
+    }
+    
+    /// Preserves per-compilation-unit warnings for complex C++ builds
+    /// - parameter contextualNotices: Array of (Notice, context) tuples
+    /// - returns: Deduplicated array preserving compilation unit boundaries
+    private func deduplicateWithCompilationUnitPreservation(_ contextualNotices: [(Notice, String)]) -> [Notice] {
+        // Group by exact warning content + compilation context to preserve unit boundaries
+        var compilationUnitGroups: [String: Notice] = [:]
+        
+        for (notice, context) in contextualNotices {
+            // Create key that includes compilation context to preserve unit boundaries
+            let compilationUnitKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)|\(notice.type.rawValue)|\(extractCompilationUnitIdentifier(from: context))"
+            
+            // Only remove true duplicates (same warning in exact same compilation context)
+            if compilationUnitGroups[compilationUnitKey] == nil {
+                compilationUnitGroups[compilationUnitKey] = notice
+            }
+        }
+        
+        return Array(compilationUnitGroups.values)
+    }
+    
+    /// Aggressive deduplication for simple builds to prevent over-counting
+    /// - parameter contextualNotices: Array of (Notice, context) tuples
+    /// - returns: Aggressively deduplicated array 
+    private func deduplicateWithAggressiveStrategy(_ contextualNotices: [(Notice, String)]) -> [Notice] {
+        // For simple builds, use content-based deduplication to prevent 2/1, 4/2 patterns
+        var contentBasedDeduplication: [String: Notice] = [:]
+        
+        for (notice, _) in contextualNotices {
+            // Create a content-based key that ignores compilation context
+            let contentKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)|\(notice.type.rawValue)"
+            
+            // Keep the first occurrence of each unique warning
+            if contentBasedDeduplication[contentKey] == nil {
+                contentBasedDeduplication[contentKey] = notice
+            }
+        }
+        
+        return Array(contentBasedDeduplication.values)
+    }
+    
+    /// Extract unique compilation unit identifier from build context
+    /// - parameter context: Build context string containing compilation information
+    /// - returns: Unique identifier for the compilation unit
+    private func extractCompilationUnitIdentifier(from context: String) -> String {
+        // Extract the most specific compilation context that differentiates units
+        var components: [String] = []
+        
+        // Target component
+        if let targetComponent = context.split(separator: "|").first, !targetComponent.isEmpty {
+            components.append("target:\(targetComponent)")
+        }
+        
+        // Architecture component 
+        if context.contains("arm64_32") {
+            components.append("arch:arm64_32")
+        } else if context.contains("arm64") {
+            components.append("arch:arm64")
+        } else if context.contains("x86_64") {
+            components.append("arch:x86_64")
+        } else {
+            components.append("arch:default")
+        }
+        
+        // Compilation signature (includes source file path for compilation units)
+        if let signatureComponent = context.split(separator: "|").last, !signatureComponent.isEmpty {
+            components.append("sig:\(signatureComponent)")
+        }
+        
+        return components.joined(separator:"|")
     }
     
     /// Extract architecture information from build context

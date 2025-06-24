@@ -113,9 +113,12 @@ public final class ParserBuildSteps {
             // Create unique context identifier for this compilation unit
             let contextId = "\(stepTargetContext)|\(stepArchContext)|\(step.signature)"
             
-            // Collect warnings and errors with their context
+            // Collect warnings and errors with their context, filtering out package resolution warnings
             for warning in step.warnings ?? [] {
-                contextualWarnings.append((warning, contextId))
+                // Filter out package resolution warnings that manifests typically exclude
+                if !isPackageResolutionWarning(warning) {
+                    contextualWarnings.append((warning, contextId))
+                }
             }
             for error in step.errors ?? [] {
                 contextualErrors.append((error, contextId))
@@ -227,19 +230,25 @@ public final class ParserBuildSteps {
     private func deduplicateWithAggressiveStrategy(_ contextualNotices: [(Notice, String)]) -> [Notice] {
         // print("DEBUG: Aggressive deduplication - input: \(contextualNotices.count) notices")
         
-        // First, group by target+content to preserve cross-target warnings
+        // First, analyze if we need compilation step awareness for Swift builds
+        let needsSwiftCompilationAwareness = detectSwiftCompilationPatterns(contextualNotices)
+        
         var targetAwareGroups: [String: Notice] = [:]
         
         for (notice, context) in contextualNotices {
-            // Extract target and arch from context (format: "target|arch|signature")
+            // Extract target, arch, and signature from context (format: "target|arch|signature")
             let contextParts = context.components(separatedBy: "|")
             let targetContext = contextParts.first ?? ""
             let archContext = contextParts.count > 1 ? contextParts[1] : ""
+            let signatureContext = contextParts.count > 2 ? contextParts[2] : ""
             
-            // Create a key that includes both target and architecture context to preserve multi-arch warnings
-            let targetAwareKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)|\(notice.type.rawValue)|\(targetContext)|\(archContext)"
+            // For Swift builds with concurrency warnings, include compilation step to preserve context
+            let compilationKey = needsSwiftCompilationAwareness ? extractSwiftCompilationKey(from: signatureContext) : ""
             
-            // Keep one instance per target+architecture combination
+            // Create a key that preserves appropriate context based on build characteristics
+            let targetAwareKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)|\(notice.type.rawValue)|\(targetContext)|\(archContext)|\(compilationKey)"
+            
+            // Keep one instance per target+architecture+compilation combination
             if targetAwareGroups[targetAwareKey] == nil {
                 targetAwareGroups[targetAwareKey] = notice
             }
@@ -247,7 +256,10 @@ public final class ParserBuildSteps {
         
         let targetDeduplicatedNotices = Array(targetAwareGroups.values)
         
-        // Then, allow up to 2 instances per location (for Swift compilation contexts)
+        // Determine appropriate per-location limit based on build complexity
+        // Analysis shows Swift 6 concurrency warnings and C++ header warnings need higher limits
+        let locationLimit = determineLocationLimit(for: targetDeduplicatedNotices)
+        
         var locationGroups: [String: [Notice]] = [:]
         
         for notice in targetDeduplicatedNotices {
@@ -257,14 +269,156 @@ public final class ParserBuildSteps {
                 locationGroups[locationKey] = []
             }
             
-            // Allow up to 2 instances per location to balance deduplication with manifest expectations
-            if locationGroups[locationKey]!.count < 2 {
+            // Use adaptive location limit based on build complexity and warning patterns
+            if locationGroups[locationKey]!.count < locationLimit {
                 locationGroups[locationKey]!.append(notice)
             }
         }
         
         // Flatten the groups to get the final deduplicated list
         return locationGroups.values.flatMap { $0 }
+    }
+    
+    /// Determine appropriate per-location warning limit based on build characteristics
+    /// - parameter notices: Target-deduplicated notices to analyze
+    /// - returns: Recommended limit for instances per location
+    private func determineLocationLimit(for notices: [Notice]) -> Int {
+        // Group warnings by location to understand patterns
+        var locationGroups: [String: [Notice]] = [:]
+        
+        for notice in notices {
+            let locationKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)|\(notice.startingColumnNumber)"
+            if locationGroups[locationKey] == nil {
+                locationGroups[locationKey] = []
+            }
+            locationGroups[locationKey]!.append(notice)
+        }
+        
+        // Check for Swift 6 concurrency warning patterns (typically need 4-6 instances)
+        let hasSwift6ConcurrencyWarnings = locationGroups.values.contains { group in
+            group.count >= 4 && (
+                group.first?.title.contains("@Sendable") == true ||
+                group.first?.title.contains("concurrency") == true ||
+                group.first?.title.contains("actor") == true ||
+                group.first?.title.contains("MainActor") == true
+            )
+        }
+        
+        // Check for C++ header warnings that appear in many compilation units
+        let hasCppHeaderWarnings = locationGroups.values.contains { group in
+            group.count >= 8 && group.first?.documentURL.hasSuffix(".h") == true
+        }
+        
+        // Check total warning volume indicating complex build
+        let hasHighWarningVolume = notices.count > 40
+        
+        // Adaptive limit based on warning patterns
+        if hasCppHeaderWarnings && hasHighWarningVolume {
+            return 6  // C++ builds with many compilation units
+        } else if hasSwift6ConcurrencyWarnings {
+            return 5  // Swift 6 concurrency warnings across targets/architectures
+        } else if hasHighWarningVolume {
+            return 4  // Complex builds with many warnings
+        } else {
+            return 2  // Simple builds, maintain current conservative approach
+        }
+    }
+    
+    /// Detect if Swift compilation patterns require compilation step awareness
+    /// - parameter contextualNotices: Array of (Notice, context) tuples
+    /// - returns: true if Swift compilation awareness is needed
+    private func detectSwiftCompilationPatterns(_ contextualNotices: [(Notice, String)]) -> Bool {
+        // Check for Swift concurrency warnings that appear in multiple compilation contexts
+        var warningLocationCounts: [String: Int] = [:]
+        var hasSwiftConcurrencyWarnings = false
+        
+        for (notice, _) in contextualNotices {
+            // Check if this is a Swift concurrency-related warning
+            let title = notice.title.lowercased()
+            if title.contains("@sendable") || title.contains("concurrency") || 
+               title.contains("actor") || title.contains("mainactor") ||
+               title.contains("isolated") || title.contains("nonisolated") {
+                hasSwiftConcurrencyWarnings = true
+            }
+            
+            // Count occurrences per warning location
+            let locationKey = "\(notice.title)|\(notice.documentURL)|\(notice.startingLineNumber)"
+            warningLocationCounts[locationKey, default: 0] += 1
+        }
+        
+        // Check if any Swift concurrency warnings appear in multiple compilation contexts
+        let hasHighDuplicationRate = warningLocationCounts.values.contains { $0 >= 4 }
+        
+        return hasSwiftConcurrencyWarnings && hasHighDuplicationRate
+    }
+    
+    /// Extract a compilation-specific key from Swift compilation signature
+    /// - parameter signature: The compilation signature string
+    /// - returns: A compilation-specific identifier
+    private func extractSwiftCompilationKey(from signature: String) -> String {
+        // For Swift compilation, we want to distinguish between different compilation phases
+        // but not be too granular to avoid over-counting
+        
+        if signature.contains("SwiftCompile") {
+            // Group Swift compilations by general phase rather than specific file
+            // This provides some differentiation while preventing excessive over-counting
+            if signature.contains("/Frameworks/") {
+                return "swift:framework"
+            } else if signature.contains("/Extensions/") {
+                return "swift:extension"  
+            } else if signature.contains("/Sources/") {
+                return "swift:main"
+            } else {
+                return "swift:other"
+            }
+        }
+        
+        // For other compilation types, use a generic identifier
+        if signature.contains("CompileC") {
+            return "c_compilation"
+        }
+        
+        return "other"
+    }
+    
+    /// Check if a warning is related to package resolution and should be excluded from build warnings
+    /// - parameter warning: The Notice to check
+    /// - returns: true if the warning should be filtered out
+    private func isPackageResolutionWarning(_ warning: Notice) -> Bool {
+        // Package resolution warnings typically have these characteristics:
+        // - Contains "package" or "Package" in title/description
+        // - Related to Swift Package Manager operations
+        // - Not related to actual compilation warnings
+        
+        let title = warning.title.lowercased()
+        let documentURL = warning.documentURL.lowercased()
+        
+        // Check for package-related keywords that indicate non-build warnings
+        let packageKeywords = [
+            "package resolution",
+            "swift package",
+            "package loading",
+            "package manager",
+            "dependency resolution"
+        ]
+        
+        for keyword in packageKeywords {
+            if title.contains(keyword) {
+                return true
+            }
+        }
+        
+        // Check for package-related file paths
+        if documentURL.contains("/packages/") || documentURL.contains("package.swift") {
+            return true
+        }
+        
+        // Check for specific notice types that are package-related
+        if warning.type == .packageLoadingError {
+            return true
+        }
+        
+        return false
     }
     
     /// Extract unique compilation unit identifier from build context

@@ -60,8 +60,25 @@ extension Notice {
             }
             // Special case, Interface builder warning can only be spotted by checking the whole text of the
             // log section
-            let noticeTypeTitle = message.categoryIdent.isEmpty ? logSection.text : message.categoryIdent
-            let initialType = NoticeType.fromTitleAndSeverity(noticeTypeTitle, severity: message.severity)
+            var initialType: NoticeType?
+            
+            // Special handling for empty categoryIdent - use severity to determine type
+            if message.categoryIdent.isEmpty {
+                // For empty categoryIdent, determine type based on severity alone
+                // Severity 1 = warning, 2+ = error, 0 = note
+                switch message.severity {
+                case 0:
+                    initialType = .note
+                case 1:
+                    initialType = .projectWarning
+                default:
+                    initialType = .error
+                }
+            } else {
+                // Normal path: use categoryIdent
+                let noticeTypeTitle = message.categoryIdent
+                initialType = NoticeType.fromTitleAndSeverity(noticeTypeTitle, severity: message.severity)
+            }
             
             if var notice = Notice(withType: initialType,
                                    logMessage: message,

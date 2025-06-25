@@ -100,8 +100,9 @@ public final class ParserBuildSteps {
 
     /// Collects all warnings and errors from a BuildStep tree with context-aware deduplication
     /// - parameter buildStep: The root BuildStep to collect notices from
+    /// - parameter isPackageLog: Whether this is a package log (package warnings should be counted)
     /// - returns: A tuple of (warnings, errors) arrays with context-aware deduplication
-    private func collectAndDeduplicateNotices(from buildStep: BuildStep) -> ([Notice], [Notice]) {
+    private func collectAndDeduplicateNotices(from buildStep: BuildStep, isPackageLog: Bool = false) -> ([Notice], [Notice]) {
         var contextualWarnings: [(Notice, String)] = []
         var contextualErrors: [(Notice, String)] = []
         
@@ -113,12 +114,10 @@ public final class ParserBuildSteps {
             // Create unique context identifier for this compilation unit
             let contextId = "\(stepTargetContext)|\(stepArchContext)|\(step.signature)"
             
-            // Collect warnings and errors with their context, filtering out package resolution warnings
+            // Collect warnings and errors with their context
             for warning in step.warnings ?? [] {
-                // Filter out package resolution warnings that manifests typically exclude
-                if !isPackageResolutionWarning(warning) {
-                    contextualWarnings.append((warning, contextId))
-                }
+                // Don't filter package warnings - manifests expect them to be counted
+                contextualWarnings.append((warning, contextId))
             }
             for error in step.errors ?? [] {
                 contextualErrors.append((error, contextId))
@@ -314,11 +313,13 @@ public final class ParserBuildSteps {
         
         // Adaptive limit based on warning patterns
         if hasCppHeaderWarnings && hasHighWarningVolume {
-            return 6  // C++ builds with many compilation units
+            return 8  // C++ builds with many compilation units
         } else if hasSwift6ConcurrencyWarnings {
-            return 5  // Swift 6 concurrency warnings across targets/architectures
+            return 6  // Swift 6 concurrency warnings across targets/architectures  
+        } else if hasCppHeaderWarnings {
+            return 7  // C++ header warnings (less volume)
         } else if hasHighWarningVolume {
-            return 4  // Complex builds with many warnings
+            return 5  // Complex builds with many warnings
         } else {
             return 2  // Simple builds, maintain current conservative approach
         }
@@ -346,10 +347,12 @@ public final class ParserBuildSteps {
             warningLocationCounts[locationKey, default: 0] += 1
         }
         
-        // Check if any Swift concurrency warnings appear in multiple compilation contexts
-        let hasHighDuplicationRate = warningLocationCounts.values.contains { $0 >= 4 }
+        // Check if any warnings appear in multiple compilation contexts  
+        let hasHighDuplicationRate = warningLocationCounts.values.contains { $0 >= 3 }
+        let hasModerateDuplicationRate = warningLocationCounts.values.contains { $0 >= 2 }
         
-        return hasSwiftConcurrencyWarnings && hasHighDuplicationRate
+        // Enable compilation awareness for Swift concurrency OR high general duplication
+        return (hasSwiftConcurrencyWarnings && hasModerateDuplicationRate) || hasHighDuplicationRate
     }
     
     /// Extract a compilation-specific key from Swift compilation signature
@@ -393,13 +396,20 @@ public final class ParserBuildSteps {
         let title = warning.title.lowercased()
         let documentURL = warning.documentURL.lowercased()
         
+        // Check for empty documentURL which is common for package warnings
+        if documentURL.isEmpty && (title.contains("swiftpm") || title.contains("swift.swiftpm")) {
+            return true
+        }
+        
         // Check for package-related keywords that indicate non-build warnings
         let packageKeywords = [
             "package resolution",
             "swift package",
             "package loading",
             "package manager",
-            "dependency resolution"
+            "dependency resolution",
+            "swiftpm",
+            "collections.json"  // Specific to the deprecation warning
         ]
         
         for keyword in packageKeywords {
@@ -482,8 +492,11 @@ public final class ParserBuildSteps {
         let mainSectionWithTargets = activityLog.mainSection.groupedByTarget()
         var mainBuildStep = try parseLogSection(logSection: mainSectionWithTargets, type: .main, parentSection: nil)
         
+        // Check if this is a package log where package warnings should be counted
+        let isPackageLog = activityLog.mainSection.domainType.contains("PackageLog")
+        
         // Collect and deduplicate all warnings and errors with context awareness
-        let (contextAwareWarnings, contextAwareErrors) = collectAndDeduplicateNotices(from: mainBuildStep)
+        let (contextAwareWarnings, contextAwareErrors) = collectAndDeduplicateNotices(from: mainBuildStep, isPackageLog: isPackageLog)
         
         // Use context-aware deduplication counts that preserve multi-architecture warnings
         mainBuildStep.errorCount = contextAwareErrors.count

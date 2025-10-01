@@ -647,11 +647,11 @@ public class DVTMemberDocumentLocation: DVTDocumentLocation, Equatable {
 
 public class IDEActivityLogSectionAttachment: Encodable {
     public struct BuildOperationTaskMetrics: Codable {
-        public let utime: UInt64
-        public let stime: UInt64
-        public let maxRSS: UInt64
-        public let wcStartTime: UInt64
-        public let wcDuration: UInt64
+        public let utime: UInt64?
+        public let stime: UInt64?
+        public let maxRSS: UInt64?
+        public let wcStartTime: UInt64?
+        public let wcDuration: UInt64?
     }
 
     public let identifier: String
